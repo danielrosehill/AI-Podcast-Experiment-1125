@@ -21,6 +21,7 @@ Environment:
     REPLICATE_API_TOKEN - Your Replicate API token (can be in .env file)
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -29,12 +30,20 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import replicate
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+# Optional: PIL for image handling
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 # Load environment variables
 load_dotenv()
@@ -71,6 +80,13 @@ VOICE_SAMPLES = {
 
 # Target episode length (~15 minutes at ~150 words per minute)
 TARGET_WORD_COUNT = 2250  # ~15 minutes of dialogue
+
+# Parallel TTS settings
+MAX_TTS_WORKERS = 4  # Number of concurrent Replicate API calls
+
+# Audio normalization settings (EBU R128 podcast standard)
+TARGET_LUFS = -16  # Podcast standard loudness
+TARGET_TP = -1.5   # True peak ceiling
 
 # System prompt for generating a diarized podcast dialogue script (~15 minutes)
 PODCAST_SCRIPT_PROMPT = """You are a podcast script writer creating an engaging two-host dialogue for "{podcast_name}".
@@ -481,6 +497,66 @@ Script:
         'description': description,
         'image_prompt': image_prompt
     }
+
+
+def generate_cover_art(client: genai.Client, image_prompt: str, output_path: Path) -> Path:
+    """
+    Generate episode cover art using Gemini's image generation.
+
+    Args:
+        client: Gemini client
+        image_prompt: Prompt describing the desired cover art
+        output_path: Where to save the generated image
+
+    Returns:
+        Path to the generated image, or None if generation failed
+    """
+    print(f"Generating cover art...")
+
+    # Enhance the prompt for podcast cover art style
+    enhanced_prompt = f"""Create a professional podcast episode cover art image.
+Style: Modern, clean, visually striking, suitable for podcast platforms.
+Square format (1:1 aspect ratio).
+No text in the image - just visual elements.
+
+Theme: {image_prompt}"""
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash-preview-05-20',
+            contents=enhanced_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio="1:1",
+                ),
+            ),
+        )
+
+        # Extract the image from response
+        for part in response.parts:
+            if part.inline_data:
+                # Save the image
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if HAS_PIL:
+                    # Use PIL for proper image handling
+                    image = Image.open(BytesIO(part.inline_data.data))
+                    image.save(output_path, format='PNG')
+                else:
+                    # Fallback: save raw bytes
+                    with open(output_path, 'wb') as f:
+                        f.write(part.inline_data.data)
+
+                print(f"  Cover art saved to: {output_path}")
+                return output_path
+
+        print("  Warning: No image generated in response")
+        return None
+
+    except Exception as e:
+        print(f"  Warning: Cover art generation failed: {e}")
+        return None
 
 
 def save_metadata_files(metadata: dict, episode_dir: Path):
