@@ -37,16 +37,17 @@ from openai import OpenAI
 load_dotenv()
 
 # Configuration
-PROJECT_ROOT = Path(__file__).parent.parent
+PIPELINE_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = PIPELINE_ROOT.parent
 
 # Queue-based directory structure
-PROMPTS_TO_PROCESS_DIR = PROJECT_ROOT / "prompts" / "to-process"
-PROMPTS_DONE_DIR = PROJECT_ROOT / "prompts" / "done"
+PROMPTS_TO_PROCESS_DIR = PIPELINE_ROOT / "prompts" / "to-process"
+PROMPTS_DONE_DIR = PIPELINE_ROOT / "prompts" / "done"
 
 # Output directories
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = PIPELINE_ROOT / "output"
 EPISODES_DIR = OUTPUT_DIR / "episodes"
-JINGLES_DIR = PROJECT_ROOT / "show-elements" / "mixed"
+JINGLES_DIR = PIPELINE_ROOT / "show-elements" / "mixed"
 
 # Ensure output directories exist
 EPISODES_DIR.mkdir(parents=True, exist_ok=True)

@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 PROJECT_ROOT = Path(__file__).parent
-PROMPTS_DIR = PROJECT_ROOT / "prompts" / "to-process"
+PROMPTS_DIR = PROJECT_ROOT / "pipeline" / "prompts" / "to-process"
 PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SAMPLE_RATE = 44100

@@ -7,7 +7,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GENERATORS_DIR="$SCRIPT_DIR/generators"
+GENERATORS_DIR="$SCRIPT_DIR/pipeline/generators"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
 # Check for virtual environment
