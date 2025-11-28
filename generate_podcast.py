@@ -20,10 +20,8 @@ import base64
 import json
 import os
 import re
-import struct
 import subprocess
 import sys
-import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -65,62 +63,81 @@ HERMAN_VOICE_UUID = "efab2c82"
 # Resemble AI API configuration
 RESEMBLE_API_URL = "https://f.cluster.resemble.ai/synthesize"
 
-# System prompt for generating the podcast script
-PODCAST_SCRIPT_PROMPT = """You are an expert podcast co-host generating a detailed, informative response for the "{podcast_name}" podcast.
+# System prompt for generating a diarized podcast dialogue script (~15 minutes)
+PODCAST_SCRIPT_PROMPT = """You are a podcast script writer creating an engaging two-host dialogue for "{podcast_name}".
 
-The human host ({host_name}) has recorded an audio prompt. Listen carefully and generate a comprehensive, educational response.
+The user has recorded an audio prompt with a topic/question. Listen carefully and generate a ~15 minute podcast episode script as a natural conversation between two AI hosts.
 
-## Your Response Style
+## The Hosts
 
-You are {ai_name}, an AI co-host who provides:
-- **Deep, substantive content** - not surface-level summaries
-- **Specific examples, data points, and real-world applications**
-- **Clear explanations that educate the listener**
-- **Natural conversation flow with occasional rhetorical questions to engage listeners**
+- **{host_name}**: The curious, enthusiastic host who asks probing questions, shares relatable examples, and keeps the conversation accessible. Tends to think out loud and make connections to everyday life.
 
-## Response Structure
+- **{co_host_name}**: The knowledgeable expert who provides deep insights, technical details, and authoritative explanations. Balances depth with clarity, using analogies to explain complex topics.
 
-Generate a response that includes:
+## Script Format
 
-1. **Acknowledgment & Context** (1-2 sentences)
-   - Briefly acknowledge what the host is asking about
-   - Frame why this topic matters
+You MUST output the script in this exact diarized format - each line starting with the speaker name followed by a colon:
 
-2. **Core Explanation** (2-3 paragraphs)
-   - Provide detailed, educational content
-   - Include specific examples, numbers, or case studies where relevant
-   - Break down complex concepts into digestible parts
-   - Use analogies to make technical concepts accessible
+{host_name}: [dialogue]
+{co_host_name}: [dialogue]
+{host_name}: [dialogue]
+...
 
-3. **Practical Implications** (1-2 paragraphs)
-   - What does this mean for the listener?
-   - How might this affect their work, life, or industry?
-   - Include actionable insights or things to watch for
+## Episode Structure (~15 minutes total when spoken)
 
-4. **Forward-Looking Perspective** (1 paragraph)
-   - Where is this heading?
-   - What questions remain unanswered?
-   - What should listeners keep an eye on?
+1. **Opening Hook** (30 seconds)
+   - {host_name} introduces the topic with an intriguing angle
+   - {co_host_name} adds a surprising fact or stakes
 
-## Guidelines
+2. **Topic Introduction** (2 minutes)
+   - Both hosts establish what they'll cover
+   - Set up why listeners should care
 
-- **Length**: Aim for 4-6 paragraphs of substantive spoken content (roughly 2-4 minutes when spoken)
-- **Tone**: Conversational but authoritative - like an expert friend explaining something fascinating
-- **Specificity**: Avoid vague generalities. Use concrete examples: "For instance, OpenAI's GPT-4 costs about $30 per million tokens, while newer efficient models have dropped this by 90%..."
-- **Engagement**: Occasionally use phrases like "And here's what's really interesting..." or "Think about it this way..." to maintain listener engagement
-- **Accuracy**: If discussing technical topics, be precise. If something is speculative, clearly mark it as such.
+3. **Core Discussion** (8-10 minutes)
+   - Back-and-forth exploration of the topic
+   - {co_host_name} provides expert insights
+   - {host_name} asks clarifying questions, plays devil's advocate
+   - Include specific examples, data, case studies
+   - Natural tangents that add value
 
-## Output Format
+4. **Practical Takeaways** (2-3 minutes)
+   - What can listeners actually do with this information?
+   - Real-world applications
 
-Start directly with your response (no "Claude:" prefix needed - the system will handle speaker attribution):
+5. **Closing Thoughts** (1-2 minutes)
+   - Future implications
+   - Tease what's coming next
+   - Sign off
 
-[Your comprehensive, educational response here]
+## Dialogue Guidelines
 
-Remember: Listeners chose this podcast to LEARN something. Give them real value, not platitudes.
-""".format(podcast_name=PODCAST_NAME, host_name=HOST_NAME, ai_name=AI_NAME)
+- **Natural speech patterns**: Include filler words occasionally ("you know", "I mean", "right"), false starts, and interruptions
+- **Reactions**: "That's fascinating!", "Wait, really?", "Hmm, that's a good point"
+- **Length variety**: Mix short reactive lines with longer explanatory passages
+- **Chemistry**: The hosts should build on each other's points, occasionally disagree respectfully
+- **Engagement hooks**: "Here's the thing...", "What most people don't realize...", "This is where it gets interesting..."
+
+## Content Requirements
+
+- **Depth**: Provide substantive, educational content - not surface-level
+- **Specificity**: Use real numbers, names, examples when possible
+- **Accuracy**: Be precise on technical topics. Mark speculation clearly.
+- **Accessibility**: Explain jargon when used
+
+## Output
+
+Generate ONLY the diarized script. No stage directions, no [brackets], no metadata - just speaker names and their dialogue.
+
+Example format:
+{host_name}: Welcome back to {podcast_name}! Today we're diving into something that's been all over the headlines.
+{co_host_name}: Yeah, and honestly, most of the coverage has been missing the real story here.
+{host_name}: Okay, so break it down for us. What's actually going on?
+
+Now generate the full ~15 minute episode script based on the user's audio prompt.
+""".format(podcast_name=PODCAST_NAME, host_name=HOST_NAME, co_host_name=CO_HOST_NAME)
 
 
-def get_client() -> genai.Client:
+def get_gemini_client() -> genai.Client:
     """Initialize Gemini client."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -128,16 +145,24 @@ def get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def get_resemble_api_key() -> str:
+    """Get Resemble AI API key."""
+    api_key = os.environ.get("RESEMBLE_API_KEY")
+    if not api_key:
+        raise ValueError("RESEMBLE_API_KEY environment variable not set. Add it to .env file.")
+    return api_key
+
+
 def transcribe_and_generate_script(client: genai.Client, audio_path: Path) -> str:
     """
-    Send audio to Gemini, transcribe it, and generate a podcast script response.
+    Send audio to Gemini, transcribe it, and generate a diarized podcast dialogue script.
 
     Args:
         client: Gemini client
         audio_path: Path to the audio file
 
     Returns:
-        Generated podcast script text
+        Generated diarized podcast script text
     """
     print(f"Uploading audio file: {audio_path}")
 
@@ -145,134 +170,172 @@ def transcribe_and_generate_script(client: genai.Client, audio_path: Path) -> st
     audio_file = client.files.upload(file=str(audio_path))
     print(f"Uploaded file: {audio_file.name}")
 
-    # Generate the script
-    print("Generating podcast script...")
+    # Generate the diarized script using a larger model for longer output
+    print("Generating diarized podcast script (~15 min episode)...")
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=[PODCAST_SCRIPT_PROMPT, audio_file]
+        contents=[PODCAST_SCRIPT_PROMPT, audio_file],
+        config=types.GenerateContentConfig(
+            max_output_tokens=16000,  # Allow for longer scripts
+        )
     )
 
     script = response.text
-    print(f"Generated script:\n{'-'*40}\n{script}\n{'-'*40}")
+    print(f"Generated script:\n{'-'*40}\n{script[:2000]}...\n{'-'*40}")
 
     return script
 
 
-def parse_audio_mime_type(mime_type: str) -> dict:
-    """Parse bits per sample and rate from audio MIME type."""
-    bits_per_sample = 16
-    rate = 24000
-
-    parts = mime_type.split(";")
-    for param in parts:
-        param = param.strip()
-        if param.lower().startswith("rate="):
-            try:
-                rate = int(param.split("=", 1)[1])
-            except (ValueError, IndexError):
-                pass
-        elif param.startswith("audio/L"):
-            try:
-                bits_per_sample = int(param.split("L", 1)[1])
-            except (ValueError, IndexError):
-                pass
-
-    return {"bits_per_sample": bits_per_sample, "rate": rate}
-
-
-def convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
-    """Convert raw audio data to WAV format with proper header."""
-    parameters = parse_audio_mime_type(mime_type)
-    bits_per_sample = parameters["bits_per_sample"]
-    sample_rate = parameters["rate"]
-    num_channels = 1
-    data_size = len(audio_data)
-    bytes_per_sample = bits_per_sample // 8
-    block_align = num_channels * bytes_per_sample
-    byte_rate = sample_rate * block_align
-    chunk_size = 36 + data_size
-
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        chunk_size,
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,
-        num_channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b"data",
-        data_size
-    )
-    return header + audio_data
-
-
-def generate_tts_audio(client: genai.Client, script: str, output_path: Path) -> Path:
+def parse_diarized_script(script: str) -> list[dict]:
     """
-    Convert podcast script to audio using Gemini TTS.
+    Parse a diarized script into a list of speaker segments.
 
     Args:
-        client: Gemini client
-        script: The podcast script text
-        output_path: Where to save the audio
+        script: The diarized script text (format: "Speaker: dialogue")
+
+    Returns:
+        List of dicts with 'speaker' and 'text' keys
+    """
+    segments = []
+    # Match lines that start with speaker name followed by colon
+    pattern = rf'^({HOST_NAME}|{CO_HOST_NAME}):\s*(.+?)(?=^(?:{HOST_NAME}|{CO_HOST_NAME}):|\Z)'
+
+    # Use multiline and dotall flags
+    matches = re.findall(pattern, script, re.MULTILINE | re.DOTALL)
+
+    for speaker, text in matches:
+        # Clean up the text
+        text = text.strip()
+        if text:
+            segments.append({
+                'speaker': speaker,
+                'text': text,
+                'voice_uuid': CORN_VOICE_UUID if speaker == HOST_NAME else HERMAN_VOICE_UUID
+            })
+
+    # Fallback: line-by-line parsing if regex didn't work well
+    if not segments:
+        print("Using fallback line-by-line parsing...")
+        for line in script.split('\n'):
+            line = line.strip()
+            if line.startswith(f"{HOST_NAME}:"):
+                text = line[len(f"{HOST_NAME}:"):].strip()
+                if text:
+                    segments.append({
+                        'speaker': HOST_NAME,
+                        'text': text,
+                        'voice_uuid': CORN_VOICE_UUID
+                    })
+            elif line.startswith(f"{CO_HOST_NAME}:"):
+                text = line[len(f"{CO_HOST_NAME}:"):].strip()
+                if text:
+                    segments.append({
+                        'speaker': CO_HOST_NAME,
+                        'text': text,
+                        'voice_uuid': HERMAN_VOICE_UUID
+                    })
+
+    print(f"Parsed {len(segments)} dialogue segments")
+    return segments
+
+
+def synthesize_with_resemble(text: str, voice_uuid: str, output_path: Path) -> Path:
+    """
+    Synthesize speech using Resemble AI API.
+
+    Args:
+        text: Text to synthesize
+        voice_uuid: Resemble AI voice UUID
+        output_path: Where to save the audio file
 
     Returns:
         Path to the generated audio file
     """
-    print("Generating TTS audio...")
+    api_key = get_resemble_api_key()
 
-    # For single-speaker (just AI response), use single speaker config
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-preview-tts",
-        contents=script,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=AI_VOICE,
-                    )
-                )
-            ),
-        )
-    )
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
 
-    # Extract audio data
-    audio_data = response.candidates[0].content.parts[0].inline_data.data
-    mime_type = response.candidates[0].content.parts[0].inline_data.mime_type
+    payload = {
+        'voice_uuid': voice_uuid,
+        'data': text,
+        'sample_rate': 44100,
+        'output_format': 'wav',
+    }
 
-    # Convert to WAV
-    wav_data = convert_to_wav(audio_data, mime_type)
+    response = requests.post(RESEMBLE_API_URL, headers=headers, json=payload)
 
-    # Save the file
+    if response.status_code != 200:
+        raise Exception(f"Resemble API error: {response.status_code} - {response.text}")
+
+    result = response.json()
+
+    if not result.get('success', False):
+        raise Exception(f"Resemble synthesis failed: {result.get('issues', 'Unknown error')}")
+
+    # Decode base64 audio content
+    audio_content = base64.b64decode(result['audio_content'])
+
+    # Save to file
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        f.write(wav_data)
+    with open(output_path, 'wb') as f:
+        f.write(audio_content)
 
-    print(f"TTS audio saved to: {output_path}")
     return output_path
 
 
-def concatenate_audio(
+def generate_dialogue_audio(segments: list[dict], output_dir: Path) -> list[Path]:
+    """
+    Generate audio for all dialogue segments using Resemble AI.
+
+    Args:
+        segments: List of parsed dialogue segments
+        output_dir: Directory to save audio files
+
+    Returns:
+        List of paths to generated audio files in order
+    """
+    audio_files = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    total = len(segments)
+    for i, segment in enumerate(segments):
+        print(f"Synthesizing segment {i+1}/{total} ({segment['speaker']})...")
+
+        output_path = output_dir / f"segment_{i:04d}_{segment['speaker'].lower()}.wav"
+
+        try:
+            synthesize_with_resemble(
+                text=segment['text'],
+                voice_uuid=segment['voice_uuid'],
+                output_path=output_path
+            )
+            audio_files.append(output_path)
+        except Exception as e:
+            print(f"  Error synthesizing segment {i+1}: {e}")
+            # Continue with remaining segments
+            continue
+
+    print(f"Generated {len(audio_files)} audio segments")
+    return audio_files
+
+
+def concatenate_audio_segments(
     output_path: Path,
-    user_audio: Path,
-    ai_audio: Path,
+    dialogue_segments: list[Path],
     intro_jingle: Path = None,
     outro_jingle: Path = None,
 ) -> Path:
     """
-    Concatenate audio segments into final podcast episode using ffmpeg.
+    Concatenate dialogue audio segments into final podcast episode using ffmpeg.
 
-    Order: intro (optional) -> user audio -> AI response -> outro (optional)
+    Order: intro (optional) -> dialogue segments -> outro (optional)
 
     Args:
         output_path: Where to save the final episode
-        user_audio: Path to user's audio prompt
-        ai_audio: Path to AI-generated response audio
+        dialogue_segments: List of paths to dialogue audio files in order
         intro_jingle: Optional intro jingle
         outro_jingle: Optional outro jingle
 
@@ -285,8 +348,7 @@ def concatenate_audio(
     audio_files = []
     if intro_jingle and intro_jingle.exists():
         audio_files.append(intro_jingle)
-    audio_files.append(user_audio)
-    audio_files.append(ai_audio)
+    audio_files.extend(dialogue_segments)
     if outro_jingle and outro_jingle.exists():
         audio_files.append(outro_jingle)
 
@@ -329,12 +391,84 @@ def concatenate_audio(
     return output_path
 
 
+def cleanup_segment_files(segment_dir: Path):
+    """Clean up temporary segment audio files."""
+    if segment_dir.exists():
+        for f in segment_dir.glob("segment_*.wav"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+
+def generate_episode_metadata(client: genai.Client, script: str) -> dict:
+    """
+    Generate episode title and description from the script using Gemini.
+
+    Args:
+        client: Gemini client
+        script: The full podcast script
+
+    Returns:
+        Dict with 'title' and 'description' keys
+    """
+    print("Generating episode title and description...")
+
+    metadata_prompt = """Based on this podcast script, generate:
+
+1. A catchy, engaging episode title (max 60 characters)
+2. A compelling episode description for podcast platforms (2-3 sentences, ~150-200 words)
+
+The description should:
+- Hook potential listeners with the main topic
+- Highlight key insights or surprises discussed
+- Use natural, engaging language
+
+Output format (use exactly these labels):
+TITLE: [your title here]
+DESCRIPTION: [your description here]
+
+Script:
+""" + script[:8000]  # Use first 8000 chars to stay within limits
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=metadata_prompt,
+    )
+
+    result_text = response.text
+
+    # Parse the response
+    title = ""
+    description = ""
+
+    if "TITLE:" in result_text:
+        title_start = result_text.index("TITLE:") + len("TITLE:")
+        title_end = result_text.index("DESCRIPTION:") if "DESCRIPTION:" in result_text else len(result_text)
+        title = result_text[title_start:title_end].strip()
+
+    if "DESCRIPTION:" in result_text:
+        desc_start = result_text.index("DESCRIPTION:") + len("DESCRIPTION:")
+        description = result_text[desc_start:].strip()
+
+    return {
+        'title': title,
+        'description': description
+    }
+
+
 def generate_podcast_episode(
     prompt_audio_path: Path,
     episode_name: str = None,
 ) -> Path:
     """
     Generate a complete podcast episode from a user's audio prompt.
+
+    Workflow:
+    1. Send audio prompt to Gemini to generate diarized dialogue script
+    2. Parse script into speaker segments
+    3. Generate audio for each segment using Resemble AI (Corn & Herman voices)
+    4. Concatenate all segments with intro/outro jingles
 
     Args:
         prompt_audio_path: Path to the user's recorded prompt
@@ -347,14 +481,16 @@ def generate_podcast_episode(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         episode_name = f"episode_{timestamp}"
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"Generating podcast episode: {episode_name}")
-    print(f"{'='*50}\n")
+    print(f"Hosts: {HOST_NAME} (Corn voice) & {CO_HOST_NAME} (Herman voice)")
+    print(f"{'='*60}\n")
 
-    # Initialize client
-    client = get_client()
+    # Initialize Gemini client
+    client = get_gemini_client()
 
-    # Step 1: Transcribe and generate script
+    # Step 1: Transcribe and generate diarized script
+    print("Step 1: Generating diarized dialogue script with Gemini...")
     script = transcribe_and_generate_script(client, prompt_audio_path)
 
     # Save the script for reference
@@ -363,27 +499,74 @@ def generate_podcast_episode(
         f.write(script)
     print(f"Script saved to: {script_path}")
 
-    # Step 2: Generate TTS audio
-    ai_audio_path = RESPONSES_DIR / f"{episode_name}_response.wav"
-    generate_tts_audio(client, script, ai_audio_path)
+    # Step 2: Parse the diarized script into segments
+    print("\nStep 2: Parsing diarized script...")
+    segments = parse_diarized_script(script)
 
-    # Step 3: Concatenate into final episode
+    if not segments:
+        raise ValueError("Failed to parse any dialogue segments from the script")
+
+    # Save parsed segments for debugging
+    segments_path = RESPONSES_DIR / f"{episode_name}_segments.json"
+    with open(segments_path, "w") as f:
+        json.dump(segments, f, indent=2)
+    print(f"Parsed segments saved to: {segments_path}")
+
+    # Step 3: Generate audio for each segment using Resemble AI
+    print(f"\nStep 3: Generating audio for {len(segments)} segments with Resemble AI...")
+    segment_audio_dir = RESPONSES_DIR / f"{episode_name}_segments"
+    dialogue_audio_files = generate_dialogue_audio(segments, segment_audio_dir)
+
+    if not dialogue_audio_files:
+        raise ValueError("Failed to generate any audio segments")
+
+    # Step 4: Concatenate into final episode
+    print("\nStep 4: Concatenating audio segments...")
     episode_path = EPISODES_DIR / f"{episode_name}.mp3"
     intro_jingle = JINGLES_DIR / "mixed-intro.mp3"
     outro_jingle = JINGLES_DIR / "mixed-outro.mp3"
 
-    concatenate_audio(
+    concatenate_audio_segments(
         output_path=episode_path,
-        user_audio=prompt_audio_path,
-        ai_audio=ai_audio_path,
+        dialogue_segments=dialogue_audio_files,
         intro_jingle=intro_jingle if intro_jingle.exists() else None,
         outro_jingle=outro_jingle if outro_jingle.exists() else None,
     )
 
-    print(f"\n{'='*50}")
+    # Cleanup segment files (optional - keep for debugging)
+    # cleanup_segment_files(segment_audio_dir)
+
+    # Step 5: Generate episode metadata (title and description)
+    print("\nStep 5: Generating episode title and description...")
+    metadata = generate_episode_metadata(client, script)
+
+    # Save metadata to JSON file
+    metadata_path = RESPONSES_DIR / f"{episode_name}_metadata.json"
+    full_metadata = {
+        'title': metadata['title'],
+        'description': metadata['description'],
+        'episode_name': episode_name,
+        'audio_file': str(episode_path),
+        'script_file': str(script_path),
+        'segments_count': len(segments),
+        'generated_at': datetime.now().isoformat(),
+    }
+    with open(metadata_path, "w") as f:
+        json.dump(full_metadata, f, indent=2)
+
+    print(f"\n{'='*60}")
     print(f"Episode generated successfully!")
-    print(f"Output: {episode_path}")
-    print(f"{'='*50}\n")
+    print(f"{'='*60}")
+    print(f"\nSUGGESTED TITLE:")
+    print(f"  {metadata['title']}")
+    print(f"\nSUGGESTED DESCRIPTION:")
+    print(f"  {metadata['description']}")
+    print(f"\nFILES:")
+    print(f"  Audio:    {episode_path}")
+    print(f"  Script:   {script_path}")
+    print(f"  Metadata: {metadata_path}")
+    print(f"  Segments: {len(segments)} dialogue turns")
+    print(f"{'='*60}\n")
 
     return episode_path
 
