@@ -327,9 +327,27 @@ def synthesize_with_chatterbox(text: str, voice_sample_url: str, output_path: Pa
     return output_path
 
 
+def synthesize_segment_task(args: tuple) -> tuple[int, Path, Exception | None]:
+    """
+    Task function for parallel TTS synthesis.
+
+    Args:
+        args: Tuple of (index, segment, voice_url, output_path)
+
+    Returns:
+        Tuple of (index, output_path, error or None)
+    """
+    i, segment, voice_url, output_path = args
+    try:
+        synthesize_with_chatterbox(segment['text'], voice_url, output_path)
+        return (i, output_path, None)
+    except Exception as e:
+        return (i, output_path, e)
+
+
 def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls: dict[str, str]) -> Path:
     """
-    Generate audio for all dialogue segments using Chatterbox.
+    Generate audio for all dialogue segments using Chatterbox with parallel processing.
 
     Args:
         segments: List of parsed dialogue segments
@@ -342,25 +360,40 @@ def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls:
     temp_dir = episode_dir / "_temp_tts"
     temp_dir.mkdir(exist_ok=True)
 
-    segment_files = []
     total_chars = sum(len(s['text']) for s in segments)
     estimated_cost = (total_chars / 1000) * 0.025
     print(f"Generating {len(segments)} segments (~{total_chars} chars, est. cost: ${estimated_cost:.2f})")
+    print(f"Using {MAX_TTS_WORKERS} parallel workers for TTS generation...")
 
+    # Prepare tasks for parallel execution
+    tasks = []
     for i, segment in enumerate(segments):
         speaker = segment['speaker']
-        text = segment['text']
-        voice_url = voice_urls[speaker]  # Use pre-uploaded URL
-
+        voice_url = voice_urls[speaker]
         segment_path = temp_dir / f"segment_{i:03d}_{speaker.lower()}.wav"
-        print(f"  [{i+1}/{len(segments)}] {speaker}: {text[:50]}...")
+        tasks.append((i, segment, voice_url, segment_path))
 
-        try:
-            synthesize_with_chatterbox(text, voice_url, segment_path)
-            segment_files.append(segment_path)
-        except Exception as e:
-            print(f"    Error synthesizing segment: {e}")
-            raise
+    # Execute TTS in parallel with thread pool
+    results = {}
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_TTS_WORKERS) as executor:
+        futures = {executor.submit(synthesize_segment_task, task): task[0] for task in tasks}
+
+        for future in concurrent.futures.as_completed(futures):
+            idx, output_path, error = future.result()
+            completed += 1
+            speaker = segments[idx]['speaker']
+            text_preview = segments[idx]['text'][:40]
+
+            if error:
+                print(f"  [{completed}/{len(segments)}] FAILED {speaker}: {error}")
+                raise error
+            else:
+                print(f"  [{completed}/{len(segments)}] {speaker}: {text_preview}...")
+                results[idx] = output_path
+
+    # Sort results by original index to maintain dialogue order
+    segment_files = [results[i] for i in sorted(results.keys())]
 
     # Concatenate all segments
     print(f"Concatenating {len(segment_files)} audio segments...")
@@ -385,6 +418,71 @@ def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls:
     return dialogue_path
 
 
+def normalize_audio_loudness(input_path: Path, output_path: Path, target_lufs: float = TARGET_LUFS) -> Path:
+    """
+    Normalize audio to target loudness using EBU R128 two-pass loudnorm filter.
+
+    Args:
+        input_path: Input audio file
+        output_path: Output normalized audio file
+        target_lufs: Target integrated loudness (default -16 LUFS for podcasts)
+
+    Returns:
+        Path to normalized audio
+    """
+    # First pass: analyze loudness
+    analyze_cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-af", f"loudnorm=I={target_lufs}:TP={TARGET_TP}:LRA=11:print_format=json",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(analyze_cmd, capture_output=True, text=True)
+
+    # Parse loudness stats from stderr (ffmpeg outputs to stderr)
+    stderr = result.stderr
+    try:
+        # Find the JSON block in stderr
+        json_start = stderr.rfind('{')
+        json_end = stderr.rfind('}') + 1
+        if json_start != -1 and json_end > json_start:
+            stats_json = stderr[json_start:json_end]
+            stats = json.loads(stats_json)
+        else:
+            # Fallback to single-pass if we can't parse
+            print("    Warning: Could not parse loudness stats, using single-pass normalization")
+            stats = None
+    except json.JSONDecodeError:
+        stats = None
+
+    # Second pass: apply normalization with measured values
+    if stats:
+        normalize_cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-af", (
+                f"loudnorm=I={target_lufs}:TP={TARGET_TP}:LRA=11:"
+                f"measured_I={stats.get('input_i', -24)}:"
+                f"measured_TP={stats.get('input_tp', -2)}:"
+                f"measured_LRA={stats.get('input_lra', 7)}:"
+                f"measured_thresh={stats.get('input_thresh', -34)}:"
+                f"offset={stats.get('target_offset', 0)}:"
+                f"linear=true:print_format=summary"
+            ),
+            "-ar", "44100", "-ac", "1",
+            str(output_path)
+        ]
+    else:
+        # Single-pass fallback
+        normalize_cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-af", f"loudnorm=I={target_lufs}:TP={TARGET_TP}:LRA=11",
+            "-ar", "44100", "-ac", "1",
+            str(output_path)
+        ]
+
+    subprocess.run(normalize_cmd, capture_output=True, check=True)
+    return output_path
+
+
 def concatenate_episode(
     dialogue_audio: Path,
     output_path: Path,
@@ -394,55 +492,65 @@ def concatenate_episode(
 ) -> Path:
     """
     Concatenate all episode audio: intro + user prompt + dialogue + outro.
+    Applies EBU R128 loudness normalization to each component for consistent volume.
     """
-    print("Assembling final episode...")
+    print("Assembling final episode with loudness normalization...")
 
     audio_files = []
+    labels = []  # For logging
     if intro_jingle and intro_jingle.exists():
         audio_files.append(intro_jingle)
+        labels.append("intro")
     if user_prompt_audio and user_prompt_audio.exists():
         audio_files.append(user_prompt_audio)
+        labels.append("prompt")
     audio_files.append(dialogue_audio)
+    labels.append("dialogue")
     if outro_jingle and outro_jingle.exists():
         audio_files.append(outro_jingle)
+        labels.append("outro")
 
-    if len(audio_files) == 1:
-        cmd = [
-            "ffmpeg", "-y", "-i", str(dialogue_audio),
-            "-c:a", "libmp3lame", "-b:a", "128k",
-            str(output_path)
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        return output_path
-
-    # Normalize and concatenate
+    # Create temp directory for normalized files
     temp_dir = output_path.parent / "_temp_concat"
     temp_dir.mkdir(exist_ok=True)
 
+    # Normalize each audio file to podcast standard (-16 LUFS)
+    print(f"  Normalizing {len(audio_files)} audio segments to {TARGET_LUFS} LUFS...")
     normalized_files = []
-    for i, audio_file in enumerate(audio_files):
-        normalized_path = temp_dir / f"temp_normalized_{i}.wav"
-        cmd = [
-            "ffmpeg", "-y", "-i", str(audio_file),
-            "-ar", "44100", "-ac", "1", "-sample_fmt", "s16",
-            str(normalized_path)
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
+    for i, (audio_file, label) in enumerate(zip(audio_files, labels)):
+        print(f"    [{i+1}/{len(audio_files)}] Normalizing {label}...")
+        normalized_path = temp_dir / f"normalized_{i}_{label}.wav"
+        normalize_audio_loudness(audio_file, normalized_path)
         normalized_files.append(normalized_path)
 
+    # Create file list for concatenation
     filelist_path = temp_dir / "filelist.txt"
     with open(filelist_path, "w") as f:
         for nf in normalized_files:
             f.write(f"file '{nf}'\n")
 
+    # Concatenate normalized files
+    print("  Concatenating normalized segments...")
+    concat_path = temp_dir / "concatenated.wav"
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", str(filelist_path),
-        "-c:a", "libmp3lame", "-b:a", "128k",
-        str(output_path)
+        "-c:a", "pcm_s16le",
+        str(concat_path)
     ]
     subprocess.run(cmd, capture_output=True, check=True)
 
+    # Final pass: normalize the complete episode and encode to MP3
+    print("  Final loudness pass and MP3 encoding...")
+    final_normalize_cmd = [
+        "ffmpeg", "-y", "-i", str(concat_path),
+        "-af", f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA=11",
+        "-c:a", "libmp3lame", "-b:a", "192k",  # Higher bitrate for quality
+        str(output_path)
+    ]
+    subprocess.run(final_normalize_cmd, capture_output=True, check=True)
+
+    # Cleanup
     shutil.rmtree(temp_dir)
 
     print(f"Final episode saved to: {output_path}")
@@ -696,9 +804,20 @@ def generate_podcast_episode(
     print("\nStep 6: Generating episode metadata...")
     metadata = generate_episode_metadata(gemini_client, script)
 
+    # Step 7: Generate cover art
+    cover_art_path = None
+    if metadata.get('image_prompt'):
+        print("\nStep 7: Generating episode cover art...")
+        cover_art_path = episode_dir / "cover.png"
+        cover_art_path = generate_cover_art(gemini_client, metadata['image_prompt'], cover_art_path)
+    else:
+        print("\nStep 7: Skipping cover art (no image prompt generated)")
+
     full_metadata = {
         'title': metadata['title'],
         'description': metadata['description'],
+        'image_prompt': metadata.get('image_prompt', ''),
+        'cover_art': str(cover_art_path) if cover_art_path else None,
         'episode_name': episode_name,
         'audio_file': str(episode_path),
         'script_file': str(script_path),
@@ -725,6 +844,8 @@ def generate_podcast_episode(
     print(f"  - script.txt")
     print(f"  - segments.json")
     print(f"  - metadata.json / metadata.txt")
+    if cover_art_path:
+        print(f"  - cover.png")
     print(f"  ({len(segments)} dialogue turns)")
     print(f"{'='*60}\n")
 
