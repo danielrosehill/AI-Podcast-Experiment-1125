@@ -32,15 +32,21 @@ load_dotenv()
 
 # Configuration
 PROJECT_ROOT = Path(__file__).parent
-AUDIO_FILES_DIR = PROJECT_ROOT / "audio-files"
-PROMPTS_DIR = AUDIO_FILES_DIR / "prompt"
-RESPONSES_DIR = AUDIO_FILES_DIR / "responses"
-EPISODES_DIR = AUDIO_FILES_DIR / "episodes"
-JINGLES_DIR = AUDIO_FILES_DIR / "jingles"
+
+# Queue-based directory structure
+PROMPTS_TO_PROCESS_DIR = PROJECT_ROOT / "prompts" / "to-process"
+PROMPTS_DONE_DIR = PROJECT_ROOT / "prompts" / "done"
+
+# Output directories
+OUTPUT_DIR = PROJECT_ROOT / "output"
+RESPONSES_DIR = OUTPUT_DIR / "responses"
+EPISODES_DIR = OUTPUT_DIR / "episodes"
+JINGLES_DIR = PROJECT_ROOT / "show-elements" / "mixed"
 
 # Ensure output directories exist
 RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
 EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+PROMPTS_DONE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Podcast configuration
 PODCAST_NAME = "AI Conversations"
@@ -320,8 +326,8 @@ def generate_podcast_episode(
 
     # Step 3: Concatenate into final episode
     episode_path = EPISODES_DIR / f"{episode_name}.mp3"
-    intro_jingle = JINGLES_DIR / "intro.mp3"
-    outro_jingle = JINGLES_DIR / "outro.mp3"
+    intro_jingle = JINGLES_DIR / "mixed-intro.mp3"
+    outro_jingle = JINGLES_DIR / "mixed-outro.mp3"
 
     concatenate_audio(
         output_path=episode_path,
@@ -339,20 +345,56 @@ def generate_podcast_episode(
     return episode_path
 
 
+def process_queue():
+    """Process all audio files in the to-process queue."""
+    audio_extensions = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+
+    # Find all audio files in the to-process directory
+    to_process = [
+        f for f in PROMPTS_TO_PROCESS_DIR.iterdir()
+        if f.is_file() and f.suffix.lower() in audio_extensions
+    ]
+
+    if not to_process:
+        print("No audio files found in the to-process queue.")
+        print(f"Add audio files to: {PROMPTS_TO_PROCESS_DIR}")
+        return
+
+    print(f"Found {len(to_process)} file(s) to process:")
+    for f in to_process:
+        print(f"  - {f.name}")
+    print()
+
+    for prompt_path in to_process:
+        try:
+            # Generate episode using the filename (without extension) as the episode name
+            episode_name = prompt_path.stem
+            episode_path = generate_podcast_episode(prompt_path, episode_name)
+
+            # Move processed file to done folder
+            done_path = PROMPTS_DONE_DIR / prompt_path.name
+            prompt_path.rename(done_path)
+            print(f"Moved {prompt_path.name} to done folder")
+
+        except Exception as e:
+            print(f"Error processing {prompt_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+
 def main():
     """Main entry point."""
-    # Default to the test prompt if no argument provided
+    # If a specific file is provided, process just that file
     if len(sys.argv) > 1:
         prompt_path = Path(sys.argv[1])
+        if not prompt_path.exists():
+            print(f"Error: Audio file not found: {prompt_path}")
+            sys.exit(1)
+        episode_path = generate_podcast_episode(prompt_path)
+        print(f"Done! Episode saved to: {episode_path}")
     else:
-        prompt_path = PROMPTS_DIR / "raw.mp3"
-
-    if not prompt_path.exists():
-        print(f"Error: Audio file not found: {prompt_path}")
-        sys.exit(1)
-
-    episode_path = generate_podcast_episode(prompt_path)
-    print(f"Done! Episode saved to: {episode_path}")
+        # Process the queue
+        process_queue()
 
 
 if __name__ == "__main__":
