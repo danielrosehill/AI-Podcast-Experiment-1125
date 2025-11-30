@@ -1,0 +1,19 @@
+{
+  "title": "Why AI Mishears You: Fine-Tuning Speech Recognition",
+  "description": "Ever found your smart speaker misunderstanding a simple request, or your speech-to-text generating comedic nonsense? This week on AI Conversations, we dive deep into the fascinating world of Automatic Speech Recognition (ASR) fine-tuning, pulling back the curtain on why our digital assistants sometimes struggle to 'get us' and how AI engineers are making them dramatically better. Herman and Emma reveal the intricate processes involved in adapting these powerful systems to understand specialized technical jargon in critical fields like medicine and law, bridge the significant linguistic divide for thousands of underrepresented languages globally, and even train AI to perfectly comprehend your individual voice, accent, and unique speaking style. Discover how this crucial work is breaking down digital barriers, enhancing accessibility, and transforming human-computer interaction, ultimately striving to make AI truly ubiquitous and beneficial for *everyone*.",
+  "episode_name": "kokoro-api-test-5seg",
+  "audio_file": "/home/daniel/repos/github/AI-Podcast-Experiment-1125/pipeline/output/episodes/kokoro-api-test-5seg/kokoro-api-test-5seg.mp3",
+  "script_file": "/home/daniel/repos/github/AI-Podcast-Experiment-1125/pipeline/output/episodes/kokoro-api-test-5seg/script.txt",
+  "segments_count": 5,
+  "tts_engine": "kokoro-82m-rocm",
+  "docker_image": "kokoro-api-rocm:latest",
+  "voices": {
+    "Herman": "am_adam",
+    "Emma": "bf_emma"
+  },
+  "generated_at": "2025-11-30T23:20:41.402246",
+  "total_tts_time": 252.48412466049194,
+  "avg_segment_time": 50.49682493209839,
+  "audio_duration": 122.15,
+  "realtime_factor": 2.0670006112197457
+}

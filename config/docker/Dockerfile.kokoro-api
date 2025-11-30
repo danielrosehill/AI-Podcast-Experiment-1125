@@ -1,0 +1,17 @@
+FROM kokoro-tts-rocm:latest
+
+# Install FastAPI dependencies
+RUN pip install --no-cache-dir fastapi uvicorn
+
+# Copy API server
+COPY kokoro_api.py /app/kokoro_api.py
+
+# Pre-download spacy model
+RUN python -c "import spacy; spacy.cli.download('en_core_web_sm')"
+
+WORKDIR /app
+EXPOSE 8880
+
+# Override the base image entrypoint
+ENTRYPOINT []
+CMD ["python", "-m", "uvicorn", "kokoro_api:app", "--host", "0.0.0.0", "--port", "8880"]
