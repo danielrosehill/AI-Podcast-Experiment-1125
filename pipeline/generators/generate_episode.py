@@ -60,6 +60,9 @@ OUTPUT_DIR = PIPELINE_ROOT / "output"
 EPISODES_DIR = OUTPUT_DIR / "episodes"
 JINGLES_DIR = PIPELINE_ROOT / "show-elements" / "mixed"
 
+# NAS destination for finished episodes
+NAS_DESTINATION = Path("/mnt/nas/AI-Podcasts/My_Weird_Prompts")
+
 # Voice samples directory
 VOICES_DIR = PROJECT_ROOT / "config" / "voices"
 
@@ -859,11 +862,13 @@ def generate_cover_art(image_prompt: str, episode_dir: Path, num_variants: int =
             }
         )
 
-        episode_dir.mkdir(parents=True, exist_ok=True)
-
         # Handle output (could be a list or single URL)
         if not isinstance(output, list):
             output = [output]
+
+        # Save images to images/ subfolder
+        images_dir = episode_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
 
         for i, image_output in enumerate(output):
             try:
@@ -874,10 +879,10 @@ def generate_cover_art(image_prompt: str, episode_dir: Path, num_variants: int =
                     image_url = str(image_output)
 
                 # Save with numbered suffix (cover_1.png, cover_2.png, cover_3.png)
-                output_path = episode_dir / f"cover_{i+1}.png"
+                output_path = images_dir / f"cover_{i+1}.png"
                 urllib.request.urlretrieve(image_url, str(output_path))
                 generated_paths.append(output_path)
-                print(f"  Cover art {i+1}/{num_variants} saved: {output_path.name}")
+                print(f"  Cover art {i+1}/{num_variants} saved: images/{output_path.name}")
             except Exception as e:
                 print(f"  Warning: Failed to save cover art {i+1}: {e}")
 
@@ -888,12 +893,15 @@ def generate_cover_art(image_prompt: str, episode_dir: Path, num_variants: int =
 
 
 def save_metadata_files(metadata: dict, episode_dir: Path):
-    """Save metadata in both JSON and plain text formats."""
-    json_path = episode_dir / "metadata.json"
+    """Save metadata in both JSON and plain text formats to metadata/ subfolder."""
+    metadata_dir = episode_dir / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = metadata_dir / "metadata.json"
     with open(json_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    txt_path = episode_dir / "metadata.txt"
+    txt_path = metadata_dir / "metadata.txt"
     txt_content = f"""EPISODE METADATA
 ================
 
@@ -935,6 +943,31 @@ Files:
         f.write(txt_content)
 
     print(f"Metadata saved to: {json_path}")
+
+
+def copy_episode_to_nas(episode_dir: Path) -> Path | None:
+    """
+    Copy the episode folder to the NAS destination.
+
+    Args:
+        episode_dir: Path to the episode folder to copy
+
+    Returns:
+        Path to the copied folder on NAS, or None if copy failed
+    """
+    if not NAS_DESTINATION.exists():
+        print(f"Warning: NAS destination not accessible: {NAS_DESTINATION}")
+        return None
+
+    try:
+        destination = NAS_DESTINATION / episode_dir.name
+        print(f"Copying episode to NAS: {destination}")
+        shutil.copytree(episode_dir, destination, dirs_exist_ok=True)
+        print(f"  Episode copied to NAS successfully")
+        return destination
+    except Exception as e:
+        print(f"Warning: Failed to copy episode to NAS: {e}")
+        return None
 
 
 def generate_podcast_episode(
@@ -1087,6 +1120,9 @@ def generate_podcast_episode(
 
     save_metadata_files(full_metadata, episode_dir)
 
+    # Copy episode to NAS
+    nas_path = copy_episode_to_nas(episode_dir)
+
     print(f"\n{'='*60}")
     print(f"Episode generated successfully!")
     print(f"{'='*60}")
@@ -1098,11 +1134,14 @@ def generate_podcast_episode(
     print(f"  - {episode_path.name}")
     print(f"  - script.txt")
     print(f"  - segments.json")
-    print(f"  - metadata.json / metadata.txt")
+    print(f"  - metadata/ (metadata.json, metadata.txt)")
     if cover_art_paths:
+        print(f"  - images/")
         for cap in cover_art_paths:
-            print(f"  - {cap.name}")
+            print(f"      - {cap.name}")
     print(f"  ({len(segments)} dialogue turns)")
+    if nas_path:
+        print(f"\nNAS COPY: {nas_path}")
     print(f"{'='*60}\n")
 
     return episode_path
