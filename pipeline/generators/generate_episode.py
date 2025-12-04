@@ -608,51 +608,66 @@ Script:
     }
 
 
-def generate_cover_art(image_prompt: str, output_path: Path) -> Path:
+def generate_cover_art(image_prompt: str, episode_dir: Path, num_variants: int = 3) -> list[Path]:
     """
-    Generate episode cover art using Replicate (Flux Schnell).
+    Generate multiple episode cover art variants using Replicate (Flux Schnell).
 
     Args:
         image_prompt: Prompt describing the desired cover art
-        output_path: Where to save the generated image
+        episode_dir: Episode directory to save images in
+        num_variants: Number of cover art variants to generate (default 3)
 
     Returns:
-        Path to the generated image, or None if generation failed
+        List of paths to generated images (may be empty if all failed)
     """
-    print(f"Generating cover art with Replicate (Flux Schnell)...")
+    print(f"Generating {num_variants} cover art variants with Replicate (Flux Schnell)...")
 
     # Enhance the prompt for podcast cover art style
-    enhanced_prompt = f"""Professional podcast episode cover art, modern clean design, visually striking, suitable for podcast platforms, square format, no text, abstract or symbolic representation. Theme: {image_prompt}"""
+    # CRITICAL: Explicitly forbid any text elements - AI image generators often produce garbled pseudo-text
+    enhanced_prompt = f"""Professional podcast episode cover art, modern clean design, visually striking, suitable for podcast platforms, square format. IMPORTANT: Do NOT include any text, words, letters, numbers, typography, titles, labels, or writing of any kind. No signs, no logos with text, no speech bubbles. Pure visual imagery only - abstract or symbolic representation. Theme: {image_prompt}"""
+
+    generated_paths = []
 
     try:
         import urllib.request
 
+        # Generate multiple variants in parallel via single API call
         output = replicate.run(
             "black-forest-labs/flux-schnell",
             input={
                 "prompt": enhanced_prompt,
                 "aspect_ratio": "1:1",
                 "output_format": "png",
-                "num_outputs": 1,
+                "num_outputs": num_variants,
             }
         )
 
-        # Download the output image
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        episode_dir.mkdir(parents=True, exist_ok=True)
 
         # Handle output (could be a list or single URL)
-        image_url = output[0] if isinstance(output, list) else output
-        if hasattr(image_url, 'url'):
-            image_url = image_url.url
-        image_url = str(image_url)
+        if not isinstance(output, list):
+            output = [output]
 
-        urllib.request.urlretrieve(image_url, str(output_path))
-        print(f"  Cover art saved to: {output_path}")
-        return output_path
+        for i, image_output in enumerate(output):
+            try:
+                # Get URL from output
+                if hasattr(image_output, 'url'):
+                    image_url = image_output.url
+                else:
+                    image_url = str(image_output)
+
+                # Save with numbered suffix (cover_1.png, cover_2.png, cover_3.png)
+                output_path = episode_dir / f"cover_{i+1}.png"
+                urllib.request.urlretrieve(image_url, str(output_path))
+                generated_paths.append(output_path)
+                print(f"  Cover art {i+1}/{num_variants} saved: {output_path.name}")
+            except Exception as e:
+                print(f"  Warning: Failed to save cover art {i+1}: {e}")
 
     except Exception as e:
         print(f"  Warning: Cover art generation failed: {e}")
-        return None
+
+    return generated_paths
 
 
 def save_metadata_files(metadata: dict, episode_dir: Path):
@@ -690,6 +705,15 @@ Files:
   - Script: {Path(metadata.get('script_file', '')).name}
 """
 
+    cover_art = metadata.get('cover_art')
+    if cover_art:
+        txt_content += "\nCover Art Options:\n"
+        if isinstance(cover_art, list):
+            for i, ca in enumerate(cover_art, 1):
+                txt_content += f"  - Option {i}: {Path(ca).name}\n"
+        else:
+            txt_content += f"  - {Path(cover_art).name}\n"
+
     with open(txt_path, "w") as f:
         f.write(txt_content)
 
@@ -703,11 +727,12 @@ def generate_podcast_episode(
     """
     Generate a complete podcast episode from a user's audio prompt using Chatterbox TTS.
 
-    Workflow:
-    1. Send audio prompt to Gemini to generate diarized dialogue script
-    2. Parse script into speaker segments
-    3. Generate multi-speaker audio using Chatterbox (instant voice cloning)
-    4. Add intro/outro jingles
+    Optimized workflow with parallel operations:
+    1. Upload voice samples + generate script (parallel)
+    2. Parse script into segments
+    3. Generate metadata + dialogue audio (parallel - metadata doesn't need audio)
+    4. Generate cover art (parallel with TTS)
+    5. Assemble final episode
 
     Args:
         prompt_audio_path: Path to the user's recorded prompt
@@ -727,36 +752,43 @@ def generate_podcast_episode(
     print(f"Generating podcast episode: {episode_name}")
     print(f"Using Chatterbox (Replicate) with Voice Cloning")
     print(f"Hosts: {HOST_NAME} & {CO_HOST_NAME}")
-    print(f"Cost: ~$0.025 per 1K characters")
+    print(f"Cost: ~$0.025 per 1K characters + ~$0.01 for cover art")
     print(f"Output folder: {episode_dir}")
     print(f"{'='*60}\n")
 
-    # Verify API keys
+    # Verify API keys and voice samples upfront
     gemini_client = get_gemini_client()
     get_replicate_client()
 
-    # Verify voice samples exist
     for speaker, sample_path in VOICE_SAMPLES.items():
         if not sample_path.exists():
             raise FileNotFoundError(f"Voice sample not found for {speaker}: {sample_path}")
         print(f"Voice sample for {speaker}: {sample_path.name}")
 
-    # Step 1: Upload voice samples to Replicate (once, reuse for all segments)
-    print("\nStep 1: Uploading voice samples to Replicate...")
-    voice_urls = upload_voice_samples()
-    print(f"  Voice samples uploaded and ready for reuse")
+    # OPTIMIZATION: Run voice upload and script generation in parallel
+    # Voice upload is slow (network), script gen is slow (LLM) - do both at once
+    print("\nStep 1: Uploading voice samples + generating script (parallel)...")
 
-    # Step 2: Generate script
-    print("\nStep 2: Generating diarized dialogue script with Gemini...")
-    script = transcribe_and_generate_script(gemini_client, prompt_audio_path)
+    voice_urls = None
+    script = None
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        voice_future = executor.submit(upload_voice_samples)
+        script_future = executor.submit(transcribe_and_generate_script, gemini_client, prompt_audio_path)
+
+        # Wait for both to complete
+        voice_urls = voice_future.result()
+        print("  Voice samples uploaded")
+        script = script_future.result()
+        print("  Script generated")
+
+    # Save script
     script_path = episode_dir / "script.txt"
     with open(script_path, "w") as f:
         f.write(script)
-    print(f"Script saved to: {script_path}")
 
-    # Step 3: Parse script
-    print("\nStep 3: Parsing diarized script...")
+    # Step 2: Parse script (fast, no parallelization needed)
+    print("\nStep 2: Parsing diarized script...")
     segments = parse_diarized_script(script)
 
     if not segments:
@@ -766,12 +798,36 @@ def generate_podcast_episode(
     with open(segments_path, "w") as f:
         json.dump(segments, f, indent=2)
 
-    # Step 4: Generate audio with Chatterbox (using pre-uploaded voice URLs)
-    print(f"\nStep 4: Generating audio with Chatterbox (voice cloning)...")
-    dialogue_audio_path = generate_dialogue_audio(segments, episode_dir, voice_urls)
+    # OPTIMIZATION: Generate metadata, cover art, and dialogue audio in parallel
+    # Metadata + cover art only need the script, not the audio
+    print("\nStep 3: Generating metadata + cover art + dialogue audio (parallel)...")
 
-    # Step 5: Assemble episode
-    print("\nStep 5: Assembling final episode...")
+    metadata = None
+    cover_art_paths = []
+    dialogue_audio_path = None
+
+    def generate_metadata_and_cover():
+        """Generate metadata then cover art (cover needs metadata's image prompt)."""
+        nonlocal metadata, cover_art_paths
+        metadata = generate_episode_metadata(gemini_client, script)
+        if metadata.get('image_prompt'):
+            cover_art_paths = generate_cover_art(metadata['image_prompt'], episode_dir, num_variants=3)
+        return metadata, cover_art_paths
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # Start metadata+cover generation
+        metadata_future = executor.submit(generate_metadata_and_cover)
+        # Start TTS generation (the heavy lift)
+        audio_future = executor.submit(generate_dialogue_audio, segments, episode_dir, voice_urls)
+
+        # Wait for both - audio is usually much slower
+        metadata, cover_art_paths = metadata_future.result()
+        print("  Metadata and cover art complete")
+        dialogue_audio_path = audio_future.result()
+        print("  Dialogue audio complete")
+
+    # Step 4: Assemble final episode
+    print("\nStep 4: Assembling final episode...")
     episode_path = episode_dir / f"{episode_name}.mp3"
     intro_jingle = JINGLES_DIR / "mixed-intro.mp3"
     outro_jingle = JINGLES_DIR / "mixed-outro.mp3"
@@ -784,28 +840,15 @@ def generate_podcast_episode(
         outro_jingle=outro_jingle if outro_jingle.exists() else None,
     )
 
-    # Cleanup dialogue WAV
+    # Cleanup dialogue intermediate file
     if dialogue_audio_path.exists():
         dialogue_audio_path.unlink()
-
-    # Step 6: Generate metadata
-    print("\nStep 6: Generating episode metadata...")
-    metadata = generate_episode_metadata(gemini_client, script)
-
-    # Step 7: Generate cover art
-    cover_art_path = None
-    if metadata.get('image_prompt'):
-        print("\nStep 7: Generating episode cover art...")
-        cover_art_path = episode_dir / "cover.png"
-        cover_art_path = generate_cover_art(metadata['image_prompt'], cover_art_path)
-    else:
-        print("\nStep 7: Skipping cover art (no image prompt generated)")
 
     full_metadata = {
         'title': metadata['title'],
         'description': metadata['description'],
         'image_prompt': metadata.get('image_prompt', ''),
-        'cover_art': str(cover_art_path) if cover_art_path else None,
+        'cover_art': [str(p) for p in cover_art_paths] if cover_art_paths else None,
         'episode_name': episode_name,
         'audio_file': str(episode_path),
         'script_file': str(script_path),
@@ -832,8 +875,9 @@ def generate_podcast_episode(
     print(f"  - script.txt")
     print(f"  - segments.json")
     print(f"  - metadata.json / metadata.txt")
-    if cover_art_path:
-        print(f"  - cover.png")
+    if cover_art_paths:
+        for cap in cover_art_paths:
+            print(f"  - {cap.name}")
     print(f"  ({len(segments)} dialogue turns)")
     print(f"{'='*60}\n")
 
