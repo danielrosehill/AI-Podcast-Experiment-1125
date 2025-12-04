@@ -81,11 +81,17 @@ VOICE_SAMPLES = {
 TARGET_WORD_COUNT = 2250  # ~15 minutes of dialogue
 
 # Parallel TTS settings
-MAX_TTS_WORKERS = 8  # Number of concurrent Replicate API calls (increase for faster generation)
+MAX_TTS_WORKERS = 4  # Number of concurrent Replicate API calls (keep low to avoid rate limits)
 
 # Audio normalization settings (EBU R128 podcast standard)
 TARGET_LUFS = -16  # Podcast standard loudness
 TARGET_TP = -1.5   # True peak ceiling
+
+# Prompt audio processing settings
+SILENCE_THRESHOLD_DB = -35  # Audio below this level is considered silence
+MIN_SILENCE_DURATION = 0.3  # Silence must be at least this long to be detected (seconds)
+MAX_SILENCE_DURATION = 0.4  # Compress longer silences down to this duration
+TRIM_LEADING_TRAILING = True  # Remove silence at start/end of prompt
 
 # System prompt for generating a diarized podcast dialogue script (~15 minutes)
 PODCAST_SCRIPT_PROMPT = """You are a podcast script writer creating an engaging two-host dialogue for "{podcast_name}".
@@ -482,6 +488,198 @@ def normalize_audio_loudness(input_path: Path, output_path: Path, target_lufs: f
     return output_path
 
 
+def process_prompt_audio(input_path: Path, output_path: Path) -> Path:
+    """
+    Process the user's prompt audio to tighten up pacing:
+    1. Trim leading/trailing silence
+    2. Detect internal silences and compress long pauses
+    3. Output a cleaner, more broadcast-ready version
+
+    Args:
+        input_path: Original prompt audio file
+        output_path: Where to save the processed audio
+
+    Returns:
+        Path to processed audio file
+    """
+    print(f"Processing prompt audio: {input_path.name}")
+
+    temp_dir = output_path.parent / "_temp_prompt_processing"
+    temp_dir.mkdir(exist_ok=True)
+
+    try:
+        # Step 1: Detect silences in the audio
+        print("  Detecting silences...")
+        silence_detect_cmd = [
+            "ffmpeg", "-i", str(input_path),
+            "-af", f"silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={MIN_SILENCE_DURATION}",
+            "-f", "null", "-"
+        ]
+        result = subprocess.run(silence_detect_cmd, capture_output=True, text=True)
+        stderr = result.stderr
+
+        # Parse silence intervals from ffmpeg output
+        silence_starts = []
+        silence_ends = []
+        for line in stderr.split('\n'):
+            if 'silence_start:' in line:
+                try:
+                    start = float(line.split('silence_start:')[1].split()[0])
+                    silence_starts.append(start)
+                except (ValueError, IndexError):
+                    pass
+            elif 'silence_end:' in line:
+                try:
+                    end = float(line.split('silence_end:')[1].split()[0])
+                    silence_ends.append(end)
+                except (ValueError, IndexError):
+                    pass
+
+        # Get audio duration
+        duration_cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)
+        ]
+        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
+        total_duration = float(duration_result.stdout.strip())
+
+        # Pair up silence intervals
+        silences = []
+        for i, start in enumerate(silence_starts):
+            if i < len(silence_ends):
+                silences.append((start, silence_ends[i]))
+            else:
+                # Silence extends to end of file
+                silences.append((start, total_duration))
+
+        if not silences:
+            print("  No significant silences detected, copying original")
+            shutil.copy(input_path, output_path)
+            shutil.rmtree(temp_dir)
+            return output_path
+
+        print(f"  Found {len(silences)} silence regions")
+
+        # Step 2: Build speech segments (inverse of silences)
+        # Also handle leading/trailing silence trimming
+        speech_segments = []
+        current_pos = 0.0
+
+        # Handle leading silence
+        if TRIM_LEADING_TRAILING and silences and silences[0][0] < 0.1:
+            # First silence starts at beginning - skip it
+            current_pos = silences[0][1]
+            silences = silences[1:]
+            print(f"  Trimming {current_pos:.2f}s leading silence")
+
+        for silence_start, silence_end in silences:
+            # Add speech segment before this silence
+            if silence_start > current_pos:
+                speech_segments.append({
+                    'start': current_pos,
+                    'end': silence_start,
+                    'type': 'speech'
+                })
+
+            # Calculate silence duration and decide how to handle it
+            silence_duration = silence_end - silence_start
+
+            if silence_duration > MAX_SILENCE_DURATION:
+                # Compress long silence to MAX_SILENCE_DURATION
+                speech_segments.append({
+                    'start': silence_start,
+                    'end': silence_start + MAX_SILENCE_DURATION,
+                    'type': 'silence_compressed',
+                    'original_duration': silence_duration
+                })
+            else:
+                # Keep short silences as-is
+                speech_segments.append({
+                    'start': silence_start,
+                    'end': silence_end,
+                    'type': 'silence_kept'
+                })
+
+            current_pos = silence_end
+
+        # Add final speech segment
+        if current_pos < total_duration:
+            final_segment_end = total_duration
+
+            # Handle trailing silence
+            if TRIM_LEADING_TRAILING and silences:
+                last_silence_start, last_silence_end = silences[-1] if silences else (0, 0)
+                if last_silence_end >= total_duration - 0.1:
+                    # Last silence extends to end - already handled by stopping at silence_start
+                    pass
+
+            speech_segments.append({
+                'start': current_pos,
+                'end': final_segment_end,
+                'type': 'speech'
+            })
+
+        # Handle trailing silence trimming
+        if TRIM_LEADING_TRAILING and speech_segments:
+            last_seg = speech_segments[-1]
+            if last_seg['type'] in ('silence_compressed', 'silence_kept'):
+                removed = speech_segments.pop()
+                print(f"  Trimming {removed['end'] - removed['start']:.2f}s trailing silence")
+
+        # Step 3: Extract and concatenate segments
+        print(f"  Extracting {len(speech_segments)} segments...")
+        segment_files = []
+
+        for i, seg in enumerate(speech_segments):
+            seg_path = temp_dir / f"seg_{i:03d}.wav"
+            duration = seg['end'] - seg['start']
+
+            extract_cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-ss", str(seg['start']),
+                "-t", str(duration),
+                "-c:a", "pcm_s16le", "-ar", "44100",
+                str(seg_path)
+            ]
+            subprocess.run(extract_cmd, capture_output=True, check=True)
+            segment_files.append(seg_path)
+
+        # Step 4: Concatenate all segments
+        print("  Concatenating processed segments...")
+        filelist_path = temp_dir / "filelist.txt"
+        with open(filelist_path, "w") as f:
+            for sf in segment_files:
+                f.write(f"file '{sf}'\n")
+
+        # Concatenate to output format (preserve original format or use wav as intermediate)
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(filelist_path),
+            "-c:a", "pcm_s16le", "-ar", "44100",
+            str(output_path)
+        ]
+        subprocess.run(concat_cmd, capture_output=True, check=True)
+
+        # Calculate time saved
+        original_duration = total_duration
+        new_duration_cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(output_path)
+        ]
+        new_duration_result = subprocess.run(new_duration_cmd, capture_output=True, text=True)
+        new_duration = float(new_duration_result.stdout.strip())
+
+        time_saved = original_duration - new_duration
+        print(f"  Original: {original_duration:.1f}s -> Processed: {new_duration:.1f}s (saved {time_saved:.1f}s)")
+
+    finally:
+        # Cleanup temp files
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+    return output_path
+
+
 def concatenate_episode(
     dialogue_audio: Path,
     output_path: Path,
@@ -763,22 +961,26 @@ def generate_podcast_episode(
             raise FileNotFoundError(f"Voice sample not found for {speaker}: {sample_path}")
         print(f"Voice sample for {speaker}: {sample_path.name}")
 
-    # OPTIMIZATION: Run voice upload and script generation in parallel
-    # Voice upload is slow (network), script gen is slow (LLM) - do both at once
-    print("\nStep 1: Uploading voice samples + generating script (parallel)...")
+    # OPTIMIZATION: Run voice upload, script generation, and prompt processing in parallel
+    # Voice upload is slow (network), script gen is slow (LLM), prompt processing is I/O bound
+    print("\nStep 1: Uploading voice samples + generating script + processing prompt audio (parallel)...")
 
     voice_urls = None
     script = None
+    processed_prompt_path = episode_dir / "prompt_processed.wav"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         voice_future = executor.submit(upload_voice_samples)
         script_future = executor.submit(transcribe_and_generate_script, gemini_client, prompt_audio_path)
+        prompt_future = executor.submit(process_prompt_audio, prompt_audio_path, processed_prompt_path)
 
-        # Wait for both to complete
+        # Wait for all to complete
         voice_urls = voice_future.result()
         print("  Voice samples uploaded")
         script = script_future.result()
         print("  Script generated")
+        processed_prompt_path = prompt_future.result()
+        print("  Prompt audio processed")
 
     # Save script
     script_path = episode_dir / "script.txt"
@@ -833,14 +1035,16 @@ def generate_podcast_episode(
     concatenate_episode(
         dialogue_audio=dialogue_audio_path,
         output_path=episode_path,
-        user_prompt_audio=prompt_audio_path,
+        user_prompt_audio=processed_prompt_path,
         intro_jingle=intro_jingle if intro_jingle.exists() else None,
         outro_jingle=outro_jingle if outro_jingle.exists() else None,
     )
 
-    # Cleanup dialogue intermediate file
+    # Cleanup intermediate files
     if dialogue_audio_path.exists():
         dialogue_audio_path.unlink()
+    if processed_prompt_path.exists():
+        processed_prompt_path.unlink()
 
     full_metadata = {
         'title': metadata['title'],

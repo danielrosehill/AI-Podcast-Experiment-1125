@@ -1,10 +1,18 @@
-# AI Podcast Experiment 1125
+# My Weird Prompts - Podcast Production Pipeline
 
-An experiment in creating a semi-automated AI podcast workflow that combines human-recorded prompts with AI-generated responses, rendered as listenable audio episodes.
+![alt text](graphics/repo/2.png)
 
-## The Idea
+**[Listen on Spotify](https://open.spotify.com/show/4RlBls1ZQxs4ciREOR8vpU)**
 
-This is an iteration of an AI podcast concept that addresses several limitations with existing solutions:
+The production pipeline for *My Weird Prompts*, a semi-automated AI podcast that combines human-recorded prompts with AI-generated responses, rendered as listenable audio episodes.
+
+## About the Show
+
+*My Weird Prompts* is a podcast where the host shares interesting, unusual, or thought-provoking prompts and AI responds with detailed, conversational explanations. The result is a hybrid human+AI podcast format that preserves the authenticity of the original question while leveraging AI for comprehensive responses.
+
+## The Approach
+
+This workflow addresses several limitations with existing AI podcast solutions:
 
 ### Why Not Notebook LM?
 Notebook LM produces great content, but the podcast style tends toward a specific Americanized, California-esque host format that doesn't suit everyone's preferences.
@@ -17,43 +25,49 @@ Previous N8N workflows (speech-to-text → LLM → text-to-speech) work but have
 ### The Solution
 A hybrid approach:
 1. **Human prompts** - Recorded audio prompts from the creator
-2. **AI responses** - Multimodal AI (like Gemini) generates podcast-style responses
-3. **Combined output** - Final episode includes: intro jingle → human prompt → pause → AI response → outro jingle
+2. **AI responses** - Multimodal AI generates podcast-style dialogue
+3. **Combined output** - Final episode includes: intro jingle → human prompt → AI dialogue → outro jingle
 
-## Use Case
-
-Perfect for:
-- Converting detailed AI conversations into listenable content
-- Consuming AI-generated explanations while multitasking (gym, walking, childcare)
-- Cost-effective podcast creation for frequent episodes (daily/weekly)
-- Open-sourcing interesting prompts and AI responses as audio content
-
-## Planned Workflow
+## Workflow
 
 ```
 [Audio Prompt Recording]
         ↓
-[Send to Multimodal AI (Gemini)]
+[Gemini: Transcribe + Generate Script]
         ↓
-[Generate Podcast Response]
+[Chatterbox TTS via Replicate]
         ↓
 [Assemble Episode]
    - Intro jingle
    - Human prompt audio
-   - Transition/pause
-   - AI response audio
+   - AI dialogue (~15 min)
    - Outro jingle
         ↓
-[Render Normalized Audio File]
+[Render Normalized MP3 + Metadata]
         ↓
-[Manual Upload to Spotify/Transistor FM]
+[Upload to Spotify]
 ```
 
-## Status
+## Quick Start
 
-Early stage - workflow design and implementation in progress.
+```bash
+# Drop audio prompts into the queue
+cp your-prompt.mp3 pipeline/prompts/to-process/
 
-## Files
+# Generate episodes
+./generate.sh
 
-- `theidea.mp3` - Audio description of the project concept
-- `audio-files/` - Directory for audio assets
+# Output appears in pipeline/output/episodes/<episode-name>/
+```
+
+## Cost
+
+Approximately $0.40 per 15-minute episode (Replicate TTS + Gemini + cover art generation).
+
+## Repository Structure
+
+- `pipeline/generators/` - Episode generation scripts
+- `pipeline/prompts/` - Audio prompt queue (to-process/done)
+- `pipeline/output/episodes/` - Rendered episodes
+- `pipeline/show-elements/` - Intro/outro jingles
+- `config/voices/` - Voice samples for TTS cloning
