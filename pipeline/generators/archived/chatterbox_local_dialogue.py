@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-AI Podcast Generator (Chatterbox via Replicate - Voice Cloning)
+AI Podcast Generator (Local Chatterbox TTS - Voice Cloning)
 
-Uses Resemble AI's Chatterbox model on Replicate for instant voice cloning.
-Clones voices from sample audio files (Corn & Herman) for natural dialogue.
-
-Cost: ~$0.025 per 1K characters (~$1.88 per 15-min episode)
+Uses a locally-running Chatterbox TTS server for instant voice cloning.
+Zero cost - runs entirely on local hardware (ROCm/CUDA).
 
 Workflow:
 1. Takes a human-recorded audio prompt
 2. Sends to Gemini to transcribe and generate a diarized podcast dialogue script (~15 min)
-3. Converts script to multi-speaker audio via Chatterbox (instant voice cloning)
-4. Concatenates: intro jingle + user prompt + AI dialogue + outro jingle
+3. Uploads voice samples to local Chatterbox server
+4. Converts script to multi-speaker audio via local Chatterbox (instant voice cloning)
+5. Concatenates: intro jingle + user prompt + AI dialogue + outro jingle
 
 Requires:
-    pip install google-genai python-dotenv replicate
+    pip install google-genai python-dotenv requests
 
 Environment:
     GEMINI_API_KEY - Your Gemini API key (can be in .env file)
-    REPLICATE_API_TOKEN - Your Replicate API token (can be in .env file)
+    CHATTERBOX_URL - Local Chatterbox server URL (default: http://localhost:8880)
+
+Start the Chatterbox server first:
+    docker start chatterbox-tts
 """
 
 import concurrent.futures
@@ -30,20 +32,12 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 
-import replicate
+import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-
-# Optional: PIL for image handling
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
 
 # Load environment variables
 load_dotenv()
@@ -68,22 +62,25 @@ VOICES_DIR = PROJECT_ROOT / "config" / "voices"
 EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 PROMPTS_DONE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Local Chatterbox server configuration
+CHATTERBOX_URL = os.environ.get("CHATTERBOX_URL", "http://localhost:8880")
+
 # Podcast configuration
 PODCAST_NAME = "AI Conversations"
 HOST_NAME = "Corn"
 CO_HOST_NAME = "Herman"
 
-# Voice sample paths for cloning
+# Voice sample paths for cloning (30s versions for local server limit)
 VOICE_SAMPLES = {
-    HOST_NAME: VOICES_DIR / "corn" / "wav" / "corn-1min.wav",
-    CO_HOST_NAME: VOICES_DIR / "herman" / "wav" / "herman-1min.wav",
+    HOST_NAME: VOICES_DIR / "corn" / "wav" / "corn-30s.wav",
+    CO_HOST_NAME: VOICES_DIR / "herman" / "wav" / "herman-30s.wav",
 }
 
 # Target episode length (~15 minutes at ~150 words per minute)
 TARGET_WORD_COUNT = 2250  # ~15 minutes of dialogue
 
-# Parallel TTS settings
-MAX_TTS_WORKERS = 4  # Number of concurrent Replicate API calls
+# Parallel TTS settings (local server can handle some parallelism)
+MAX_TTS_WORKERS = 2  # Conservative for local GPU - adjust based on VRAM
 
 # Audio normalization settings (EBU R128 podcast standard)
 TARGET_LUFS = -16  # Podcast standard loudness
@@ -175,14 +172,43 @@ def get_gemini_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def get_replicate_client():
-    """Verify Replicate API token is set."""
-    api_token = os.environ.get("REPLICATE_API_TOKEN") or os.environ.get("REPLICATE_API")
-    if not api_token:
-        raise ValueError("REPLICATE_API_TOKEN environment variable not set. Add it to .env file.")
-    # Set it for the replicate library
-    os.environ["REPLICATE_API_TOKEN"] = api_token
-    return True
+def check_chatterbox_server() -> bool:
+    """Check if the local Chatterbox server is running."""
+    try:
+        # Try root endpoint - the server serves a web UI there
+        response = requests.get(f"{CHATTERBOX_URL}/", timeout=5)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
+def upload_voice_to_chatterbox(voice_path: Path, voice_name: str) -> str:
+    """
+    Upload a voice sample to the local Chatterbox server for cloning.
+
+    Args:
+        voice_path: Path to the voice sample WAV file
+        voice_name: Name to use for the uploaded voice
+
+    Returns:
+        Filename of the uploaded reference audio
+    """
+    # Create a unique filename for this voice
+    filename = f"{voice_name.lower()}_reference.wav"
+
+    with open(voice_path, 'rb') as f:
+        # API expects 'files' parameter (array of files)
+        files = {'files': (filename, f, 'audio/wav')}
+        response = requests.post(
+            f"{CHATTERBOX_URL}/upload_reference",
+            files=files,
+            timeout=60
+        )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to upload voice sample: {response.text}")
+
+    return filename
 
 
 def transcribe_and_generate_script(client: genai.Client, audio_path: Path) -> str:
@@ -248,82 +274,50 @@ def parse_diarized_script(script: str) -> list[dict]:
     return segments
 
 
-def upload_voice_samples() -> dict[str, str]:
+def synthesize_with_local_chatterbox(
+    text: str,
+    reference_filename: str,
+    output_path: Path,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+) -> Path:
     """
-    Upload voice samples to Replicate once and return reusable URLs.
-
-    Returns:
-        Dict mapping speaker name to uploaded file URL
-    """
-    uploaded_urls = {}
-
-    for speaker, sample_path in VOICE_SAMPLES.items():
-        if not sample_path.exists():
-            raise FileNotFoundError(f"Voice sample not found for {speaker}: {sample_path}")
-
-        print(f"  Uploading voice sample for {speaker}...")
-        file = replicate.files.create(
-            file=sample_path,
-            metadata={"speaker": speaker, "purpose": "voice_cloning"}
-        )
-        uploaded_urls[speaker] = file.urls['get']
-        print(f"    Uploaded: {file.id}")
-
-    return uploaded_urls
-
-
-def cleanup_uploaded_files(uploaded_urls: dict[str, str]):
-    """
-    Delete uploaded voice samples from Replicate after use.
-    """
-    for speaker, url in uploaded_urls.items():
-        try:
-            # Extract file ID from URL and delete
-            # URLs look like: https://replicate.delivery/pbxt/FILE_ID/filename
-            # We need to list files and find by URL
-            pass  # Files auto-expire, skip cleanup for now
-        except Exception as e:
-            print(f"  Warning: Could not clean up file for {speaker}: {e}")
-
-
-def synthesize_with_chatterbox(text: str, voice_sample_url: str, output_path: Path) -> Path:
-    """
-    Synthesize speech using Chatterbox on Replicate with instant voice cloning.
+    Synthesize speech using the local Chatterbox server with voice cloning.
 
     Args:
         text: Text to synthesize
-        voice_sample_url: URL to pre-uploaded voice sample (from replicate.files.create)
+        reference_filename: Filename of the uploaded reference audio
         output_path: Where to save the generated audio
+        exaggeration: Voice exaggeration factor (0-1)
+        cfg_weight: CFG weight for generation
 
     Returns:
         Path to the generated audio file
     """
-    # Run Chatterbox on Replicate using pre-uploaded URL
-    output = replicate.run(
-        "resemble-ai/chatterbox:1b8422bc49635c20d0a84e387ed20879c0dd09254ecdb4e75dc4bec10ff94e97",
-        input={
-            "prompt": text,
-            "audio_prompt": voice_sample_url,  # Use URL instead of file object
-            "exaggeration": 0.5,
-            "cfg_weight": 0.5,
-        }
+    payload = {
+        "text": text,
+        "voice_mode": "clone",
+        "reference_audio_filename": reference_filename,
+        "output_format": "wav",
+        "split_text": True,
+        "chunk_size": 200,
+        "exaggeration": exaggeration,
+        "cfg_weight": cfg_weight,
+    }
+
+    response = requests.post(
+        f"{CHATTERBOX_URL}/tts",
+        json=payload,
+        timeout=300,  # Long timeout for local generation
     )
 
-    # Download the output - handle both URL string and FileOutput object
-    import urllib.request
+    if response.status_code != 200:
+        raise RuntimeError(f"TTS generation failed: {response.text}")
+
+    # Save the audio response
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Get the URL from the output (handles FileOutput objects from newer replicate lib)
-    output_url = str(output) if hasattr(output, '__str__') else output
-    if hasattr(output, 'url'):
-        output_url = output.url
-    elif hasattr(output, 'read'):
-        # It's a file-like object, read and write directly
-        with open(output_path, 'wb') as f:
-            f.write(output.read())
-        return output_path
-
-    urllib.request.urlretrieve(output_url, str(output_path))
+    with open(output_path, 'wb') as f:
+        f.write(response.content)
 
     return output_path
 
@@ -333,27 +327,31 @@ def synthesize_segment_task(args: tuple) -> tuple[int, Path, Exception | None]:
     Task function for parallel TTS synthesis.
 
     Args:
-        args: Tuple of (index, segment, voice_url, output_path)
+        args: Tuple of (index, segment, reference_filename, output_path)
 
     Returns:
         Tuple of (index, output_path, error or None)
     """
-    i, segment, voice_url, output_path = args
+    i, segment, reference_filename, output_path = args
     try:
-        synthesize_with_chatterbox(segment['text'], voice_url, output_path)
+        synthesize_with_local_chatterbox(segment['text'], reference_filename, output_path)
         return (i, output_path, None)
     except Exception as e:
         return (i, output_path, e)
 
 
-def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls: dict[str, str]) -> Path:
+def generate_dialogue_audio(
+    segments: list[dict],
+    episode_dir: Path,
+    voice_references: dict[str, str]
+) -> Path:
     """
-    Generate audio for all dialogue segments using Chatterbox with parallel processing.
+    Generate audio for all dialogue segments using local Chatterbox with parallel processing.
 
     Args:
         segments: List of parsed dialogue segments
         episode_dir: Directory to save intermediate files
-        voice_urls: Dict mapping speaker name to pre-uploaded voice sample URL
+        voice_references: Dict mapping speaker name to uploaded reference filename
 
     Returns:
         Path to the combined dialogue audio
@@ -362,17 +360,17 @@ def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls:
     temp_dir.mkdir(exist_ok=True)
 
     total_chars = sum(len(s['text']) for s in segments)
-    estimated_cost = (total_chars / 1000) * 0.025
-    print(f"Generating {len(segments)} segments (~{total_chars} chars, est. cost: ${estimated_cost:.2f})")
-    print(f"Using {MAX_TTS_WORKERS} parallel workers for TTS generation...")
+    print(f"Generating {len(segments)} segments (~{total_chars} chars)")
+    print(f"Using {MAX_TTS_WORKERS} parallel workers for local TTS generation...")
+    print(f"(Zero cost - running on local GPU)")
 
     # Prepare tasks for parallel execution
     tasks = []
     for i, segment in enumerate(segments):
         speaker = segment['speaker']
-        voice_url = voice_urls[speaker]
-        segment_path = temp_dir / f"segment_{i:03d}_{speaker.lower()}.mp3"
-        tasks.append((i, segment, voice_url, segment_path))
+        reference_filename = voice_references[speaker]
+        segment_path = temp_dir / f"segment_{i:03d}_{speaker.lower()}.wav"
+        tasks.append((i, segment, reference_filename, segment_path))
 
     # Execute TTS in parallel with thread pool
     results = {}
@@ -404,11 +402,11 @@ def generate_dialogue_audio(segments: list[dict], episode_dir: Path, voice_urls:
         for sf in segment_files:
             f.write(f"file '{sf}'\n")
 
-    dialogue_path = episode_dir / "dialogue.mp3"
+    dialogue_path = episode_dir / "dialogue.wav"
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", str(filelist_path),
-        "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100",
+        "-c:a", "pcm_s16le", "-ar", "44100",
         str(dialogue_path)
     ]
     subprocess.run(cmd, capture_output=True, check=True)
@@ -608,53 +606,6 @@ Script:
     }
 
 
-def generate_cover_art(image_prompt: str, output_path: Path) -> Path:
-    """
-    Generate episode cover art using Replicate (Flux Schnell).
-
-    Args:
-        image_prompt: Prompt describing the desired cover art
-        output_path: Where to save the generated image
-
-    Returns:
-        Path to the generated image, or None if generation failed
-    """
-    print(f"Generating cover art with Replicate (Flux Schnell)...")
-
-    # Enhance the prompt for podcast cover art style
-    enhanced_prompt = f"""Professional podcast episode cover art, modern clean design, visually striking, suitable for podcast platforms, square format, no text, abstract or symbolic representation. Theme: {image_prompt}"""
-
-    try:
-        import urllib.request
-
-        output = replicate.run(
-            "black-forest-labs/flux-schnell",
-            input={
-                "prompt": enhanced_prompt,
-                "aspect_ratio": "1:1",
-                "output_format": "png",
-                "num_outputs": 1,
-            }
-        )
-
-        # Download the output image
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Handle output (could be a list or single URL)
-        image_url = output[0] if isinstance(output, list) else output
-        if hasattr(image_url, 'url'):
-            image_url = image_url.url
-        image_url = str(image_url)
-
-        urllib.request.urlretrieve(image_url, str(output_path))
-        print(f"  Cover art saved to: {output_path}")
-        return output_path
-
-    except Exception as e:
-        print(f"  Warning: Cover art generation failed: {e}")
-        return None
-
-
 def save_metadata_files(metadata: dict, episode_dir: Path):
     """Save metadata in both JSON and plain text formats."""
     json_path = episode_dir / "metadata.json"
@@ -701,13 +652,14 @@ def generate_podcast_episode(
     episode_name: str = None,
 ) -> Path:
     """
-    Generate a complete podcast episode from a user's audio prompt using Chatterbox TTS.
+    Generate a complete podcast episode from a user's audio prompt using local Chatterbox TTS.
 
     Workflow:
     1. Send audio prompt to Gemini to generate diarized dialogue script
     2. Parse script into speaker segments
-    3. Generate multi-speaker audio using Chatterbox (instant voice cloning)
-    4. Add intro/outro jingles
+    3. Upload voice samples to local Chatterbox server
+    4. Generate multi-speaker audio using local Chatterbox (instant voice cloning)
+    5. Add intro/outro jingles
 
     Args:
         prompt_audio_path: Path to the user's recorded prompt
@@ -725,15 +677,24 @@ def generate_podcast_episode(
 
     print(f"\n{'='*60}")
     print(f"Generating podcast episode: {episode_name}")
-    print(f"Using Chatterbox (Replicate) with Voice Cloning")
+    print(f"Using LOCAL Chatterbox TTS with Voice Cloning")
     print(f"Hosts: {HOST_NAME} & {CO_HOST_NAME}")
-    print(f"Cost: ~$0.025 per 1K characters")
+    print(f"Cost: FREE (local GPU inference)")
+    print(f"Server: {CHATTERBOX_URL}")
     print(f"Output folder: {episode_dir}")
     print(f"{'='*60}\n")
 
-    # Verify API keys
+    # Check Chatterbox server is running
+    print("Checking local Chatterbox server...")
+    if not check_chatterbox_server():
+        raise RuntimeError(
+            f"Local Chatterbox server not available at {CHATTERBOX_URL}\n"
+            f"Start it with: docker start chatterbox-tts"
+        )
+    print("  Server is running!")
+
+    # Verify API key
     gemini_client = get_gemini_client()
-    get_replicate_client()
 
     # Verify voice samples exist
     for speaker, sample_path in VOICE_SAMPLES.items():
@@ -741,10 +702,14 @@ def generate_podcast_episode(
             raise FileNotFoundError(f"Voice sample not found for {speaker}: {sample_path}")
         print(f"Voice sample for {speaker}: {sample_path.name}")
 
-    # Step 1: Upload voice samples to Replicate (once, reuse for all segments)
-    print("\nStep 1: Uploading voice samples to Replicate...")
-    voice_urls = upload_voice_samples()
-    print(f"  Voice samples uploaded and ready for reuse")
+    # Step 1: Upload voice samples to local Chatterbox
+    print("\nStep 1: Uploading voice samples to local Chatterbox...")
+    voice_references = {}
+    for speaker, sample_path in VOICE_SAMPLES.items():
+        print(f"  Uploading {speaker}'s voice...")
+        reference_filename = upload_voice_to_chatterbox(sample_path, speaker)
+        voice_references[speaker] = reference_filename
+        print(f"    Uploaded as: {reference_filename}")
 
     # Step 2: Generate script
     print("\nStep 2: Generating diarized dialogue script with Gemini...")
@@ -766,9 +731,9 @@ def generate_podcast_episode(
     with open(segments_path, "w") as f:
         json.dump(segments, f, indent=2)
 
-    # Step 4: Generate audio with Chatterbox (using pre-uploaded voice URLs)
-    print(f"\nStep 4: Generating audio with Chatterbox (voice cloning)...")
-    dialogue_audio_path = generate_dialogue_audio(segments, episode_dir, voice_urls)
+    # Step 4: Generate audio with local Chatterbox
+    print(f"\nStep 4: Generating audio with local Chatterbox (voice cloning)...")
+    dialogue_audio_path = generate_dialogue_audio(segments, episode_dir, voice_references)
 
     # Step 5: Assemble episode
     print("\nStep 5: Assembling final episode...")
@@ -792,25 +757,16 @@ def generate_podcast_episode(
     print("\nStep 6: Generating episode metadata...")
     metadata = generate_episode_metadata(gemini_client, script)
 
-    # Step 7: Generate cover art
-    cover_art_path = None
-    if metadata.get('image_prompt'):
-        print("\nStep 7: Generating episode cover art...")
-        cover_art_path = episode_dir / "cover.png"
-        cover_art_path = generate_cover_art(metadata['image_prompt'], cover_art_path)
-    else:
-        print("\nStep 7: Skipping cover art (no image prompt generated)")
-
     full_metadata = {
         'title': metadata['title'],
         'description': metadata['description'],
         'image_prompt': metadata.get('image_prompt', ''),
-        'cover_art': str(cover_art_path) if cover_art_path else None,
         'episode_name': episode_name,
         'audio_file': str(episode_path),
         'script_file': str(script_path),
         'segments_count': len(segments),
-        'tts_engine': 'chatterbox-replicate',
+        'tts_engine': 'chatterbox-local',
+        'chatterbox_url': CHATTERBOX_URL,
         'voice_samples': {
             HOST_NAME: str(VOICE_SAMPLES[HOST_NAME]),
             CO_HOST_NAME: str(VOICE_SAMPLES[CO_HOST_NAME]),
@@ -832,8 +788,6 @@ def generate_podcast_episode(
     print(f"  - script.txt")
     print(f"  - segments.json")
     print(f"  - metadata.json / metadata.txt")
-    if cover_art_path:
-        print(f"  - cover.png")
     print(f"  ({len(segments)} dialogue turns)")
     print(f"{'='*60}\n")
 
